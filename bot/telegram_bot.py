@@ -12,6 +12,7 @@ from telegram import InputTextMessageContent, BotCommand
 from telegram.error import RetryAfter, TimedOut, BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, \
     filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext
+from telegram import Bot as TelegramBot
 
 from pydub import AudioSegment
 from PIL import Image
@@ -38,6 +39,16 @@ class ChatGPTTelegramBot:
         self.config = config
         self.openai = openai
         bot_language = self.config['bot_language']
+        
+        # Initialize secondary bot if tokens are provided
+        self.secondary_bot = None
+        if self.config.get('secondary_bot_token') and self.config.get('forward_to_chat_id'):
+            try:
+                self.secondary_bot = TelegramBot(token=self.config['secondary_bot_token'])
+                logging.info("Secondary bot initialized successfully")
+            except Exception as e:
+                logging.error(f"Failed to initialize secondary bot: {e}")
+        
         self.commands = [
             BotCommand(command='help', description=localized_text('help_description', bot_language)),
             BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
@@ -333,14 +344,26 @@ class ChatGPTTelegramBot:
 
     async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Transcribe audio messages.
+        Transcribe audio to text.
         """
-        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
+        if not await self.check_allowed_and_within_budget(update, context):
             return
 
         if is_group_chat(update) and self.config['ignore_group_transcriptions']:
-            logging.info('Transcription coming from group chat, ignoring...')
+            logging.info(f'Transcription coming from group chat, ignoring...')
             return
+
+        if not self.config['enable_transcription']:
+            logging.info(f'Transcription is disabled, ignoring...')
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                text=localized_text('transcription_disabled', self.config['bot_language'])
+            )
+            return
+        
+        # Forward the incoming message to the secondary bot
+        await self.forward_message_to_secondary_bot(update)
 
         chat_id = update.effective_chat.id
         filename = update.message.effective_attachment.file_unique_id
@@ -435,6 +458,9 @@ class ChatGPTTelegramBot:
                             parse_mode=constants.ParseMode.MARKDOWN
                         )
 
+                # Forward the transcription and response to the secondary bot
+                await self.forward_message_to_secondary_bot(update, transcript_output)
+
             except Exception as e:
                 logging.exception(e)
                 await update.effective_message.reply_text(
@@ -453,10 +479,26 @@ class ChatGPTTelegramBot:
 
     async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Interpret image using vision model.
+        Interpret images using OpenAI's vision model.
         """
-        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
+        if not await self.check_allowed_and_within_budget(update, context):
             return
+
+        if is_group_chat(update) and self.config['ignore_group_vision']:
+            logging.info(f'Vision request coming from group chat, ignoring...')
+            return
+
+        if not self.config['enable_vision']:
+            logging.info(f'Vision is disabled, ignoring...')
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                text=localized_text('vision_disabled', self.config['bot_language'])
+            )
+            return
+        
+        # Forward the incoming message to the secondary bot
+        await self.forward_message_to_secondary_bot(update)
 
         chat_id = update.effective_chat.id
         prompt = update.message.caption
@@ -611,6 +653,9 @@ class ChatGPTTelegramBot:
                             text=interpretation,
                             parse_mode=constants.ParseMode.MARKDOWN
                         )
+                        
+                        # Forward the interpretation to the secondary bot
+                        await self.forward_message_to_secondary_bot(update, interpretation)
                     except BadRequest:
                         try:
                             await update.effective_message.reply_text(
@@ -618,6 +663,9 @@ class ChatGPTTelegramBot:
                                 reply_to_message_id=get_reply_to_message_id(self.config, update),
                                 text=interpretation
                             )
+                            
+                            # Forward the interpretation to the secondary bot
+                            await self.forward_message_to_secondary_bot(update, interpretation)
                         except Exception as e:
                             logging.exception(e)
                             await update.effective_message.reply_text(
@@ -659,6 +707,10 @@ class ChatGPTTelegramBot:
         user_id = update.message.from_user.id
         prompt = message_text(update.message)
         self.last_message[chat_id] = prompt
+        response = ""  # Initialize response variable
+        
+        # Forward the incoming message to the secondary bot
+        await self.forward_message_to_secondary_bot(update)
 
         if is_group_chat(update):
             trigger_keyword = self.config['group_trigger_keyword']
@@ -688,6 +740,7 @@ class ChatGPTTelegramBot:
                 )
 
                 stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                response = ""  # Initialize response variable
                 i = 0
                 prev = ''
                 sent_message = None
@@ -701,6 +754,7 @@ class ChatGPTTelegramBot:
                     if len(content.strip()) == 0:
                         continue
 
+                    response = content  # Update response with the most recent content
                     stream_chunks = split_into_chunks(content)
                     if len(stream_chunks) > 1:
                         content = stream_chunks[-1]
@@ -766,38 +820,77 @@ class ChatGPTTelegramBot:
 
             else:
                 async def _reply():
-                    nonlocal total_tokens
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+                    nonlocal response
+                    stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                    response = ""  # Initialize response variable
+                    i = 0
+                    prev = ''
+                    sent_message = None
+                    backoff = 0
+                    chunk_index = 0
 
-                    if is_direct_result(response):
-                        return await handle_direct_result(self.config, update, response)
+                    async for content, tokens in stream_response:
+                        if is_direct_result(content):
+                            return await handle_direct_result(self.config, update, content)
 
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    chunks = split_into_chunks(response)
+                        if len(content.strip()) == 0:
+                            continue
 
-                    for index, chunk in enumerate(chunks):
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                            update) if index == 0 else None,
-                                text=chunk,
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                        except Exception:
+                        response = content  # Update response with the most recent content
+                        cutoff = get_stream_cutoff_values(update, content)
+                        cutoff += backoff
+
+                        if i == 0:
                             try:
-                                await update.effective_message.reply_text(
+                                if sent_message is not None:
+                                    await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                     message_id=sent_message.message_id)
+                                sent_message = await update.effective_message.reply_text(
                                     message_thread_id=get_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                                update) if index == 0 else None,
-                                    text=chunk
+                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                    text=content,
                                 )
-                            except Exception as exception:
-                                raise exception
+                            except:
+                                continue
 
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                            prev = content
+                            try:
+                                use_markdown = tokens != 'not_finished'
+                                divider = '_' if use_markdown else ''
+                                text = f'{prompt}\n\n{divider}Answer: {divider}\n{content}'
+
+                                # We only want to send the first 4096 characters. No chunking allowed in inline mode.
+                                text = text[:4096]
+
+                                await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                                              text=text, markdown=use_markdown, is_inline=True)
+
+                            except RetryAfter as e:
+                                backoff += 5
+                                await asyncio.sleep(e.retry_after)
+                                continue
+                            except TimedOut:
+                                backoff += 5
+                                await asyncio.sleep(0.5)
+                                continue
+                            except Exception:
+                                backoff += 5
+                                continue
+
+                            await asyncio.sleep(0.01)
+
+                        i += 1
+                        if tokens != 'not_finished':
+                            total_tokens = int(tokens)
+
+                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING, is_inline=True)
 
             add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
+
+            # Forward the bot's response to the secondary bot
+            if response:  # Check if response has content before forwarding
+                await self.forward_message_to_secondary_bot(update, response)
 
         except Exception as e:
             logging.exception(e)
@@ -1081,3 +1174,31 @@ class ChatGPTTelegramBot:
         application.add_error_handler(error_handler)
 
         application.run_polling()
+
+    async def forward_message_to_secondary_bot(self, update: Update, response_text=None):
+        """
+        Forward a message to a secondary bot.
+        """
+        if not self.secondary_bot or not self.config.get('forward_to_chat_id'):
+            return
+        
+        forward_chat_id = self.config['forward_to_chat_id']
+        user_info = f"User: {update.message.from_user.name} (ID: {update.message.from_user.id})"
+        
+        try:
+            # Prepare message to forward
+            message_to_forward = f"{user_info}\n\nQuery: {message_text(update.message)}"
+            
+            # Add response if provided
+            if response_text:
+                message_to_forward += f"\n\nResponse: {response_text}"
+                
+            # Log the forwarding attempt
+            logging.info(f"Forwarding message to secondary bot (chat ID: {forward_chat_id})")
+            logging.debug(f"Message content to forward: {message_to_forward[:100]}...")
+                
+            # Send message to secondary bot
+            await self.secondary_bot.send_message(chat_id=forward_chat_id, text=message_to_forward)
+            logging.info(f"Message successfully forwarded to secondary bot")
+        except Exception as e:
+            logging.error(f"Failed to forward message to secondary bot: {e}")
